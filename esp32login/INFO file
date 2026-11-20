@@ -1,0 +1,262 @@
+/*
+ * esp32_login.ino
+ * Serial login demonstration for ESP32 (Arduino-ESP32 core 2.x or 3.x).
+ *
+ * EDUCATIONAL PROTOTYPE. The ESP32 does NOT run the Verilog design. This sketch
+ * is a software model of the same login behaviour, independently runnable
+ * without any FPGA. A hardcoded credential is NOT production-grade security.
+ *
+ * Serial Monitor: 115200 baud, line ending = "Newline" (or "Both NL & CR").
+ *
+ * Commands:
+ *   <1-4 hex chars>  e.g. A or 000A   -> login attempt (valid credential = 0xA)
+ *   #RESET           -> start administrative reset (then type CONFIRM)
+ *   #STATUS          -> print current state
+ *   #LOGOUT          -> log out after a successful login
+ */
+
+// ---------------- Optional hardware (set to 0 if nothing is wired) ----------
+#define USE_INDICATORS 1
+const uint8_t PIN_LED_GREEN = 25;
+const uint8_t PIN_LED_RED   = 26;
+const uint8_t PIN_BUZZER    = 27;   // ACTIVE buzzer, 3.3 V compatible, low current
+
+// ---------------- Login configuration ---------------------------------------
+const uint16_t DEMO_CREDENTIAL = 0x000A;  // matches 4'b1010 in the Verilog RTL
+const uint8_t  MAX_ATTEMPTS    = 3;
+const size_t   LINE_MAX        = 24;
+const char     ADMIN_CMD[]     = "#RESET";
+const char     ADMIN_CONFIRM[] = "CONFIRM";
+const unsigned long ADMIN_TIMEOUT_MS = 10000;
+
+// ---------------- State machine (mirrors the RTL FSM names) -----------------
+enum LoginState { ST_IDLE, ST_INPUT, ST_GRANTED, ST_LOCKED };
+// VERIFY and DENIED are momentary in software: they are handled inside
+// processLogin() and reported through messages.
+
+LoginState state        = ST_IDLE;
+uint8_t    failedCount  = 0;
+bool       awaitConfirm = false;
+unsigned long confirmDeadline = 0;
+
+char   lineBuf[LINE_MAX + 1];
+size_t lineLen = 0;
+
+// Non-blocking indicator pulse
+unsigned long indicatorOffAt = 0;
+uint8_t activeLed = 0;
+
+// ---------------- Indicators ------------------------------------------------
+void indicatorsInit() {
+#if USE_INDICATORS
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_LED_RED, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+#endif
+}
+
+void indicate(uint8_t led, bool buzz, unsigned long ms) {
+#if USE_INDICATORS
+  activeLed = led;
+  digitalWrite(PIN_LED_GREEN, led == PIN_LED_GREEN ? HIGH : LOW);
+  digitalWrite(PIN_LED_RED,   led == PIN_LED_RED   ? HIGH : LOW);
+  digitalWrite(PIN_BUZZER, buzz ? HIGH : LOW);
+  indicatorOffAt = millis() + ms;
+#endif
+}
+
+void indicatorsUpdate() {
+#if USE_INDICATORS
+  if (indicatorOffAt != 0 && (long)(millis() - indicatorOffAt) >= 0) {
+    digitalWrite(PIN_BUZZER, LOW);
+    digitalWrite(PIN_LED_GREEN, LOW);
+    // Red LED stays on while locked as a lockout indicator.
+    digitalWrite(PIN_LED_RED, state == ST_LOCKED ? HIGH : LOW);
+    indicatorOffAt = 0;
+  }
+#endif
+}
+
+// ---------------- Helpers ---------------------------------------------------
+const char *stateName() {
+  switch (state) {
+    case ST_IDLE:    return "IDLE";
+    case ST_INPUT:   return "INPUT";
+    case ST_GRANTED: return "GRANTED";
+    case ST_LOCKED:  return "LOCKED";
+  }
+  return "?";
+}
+
+void printPrompt() {
+  if (state == ST_LOCKED) {
+    Serial.println("[LOCKED] Interface locked. Administrator: type #RESET.");
+  } else if (state == ST_GRANTED) {
+    Serial.println("[GRANTED] Logged in. Type #LOGOUT to end the session.");
+  } else {
+    Serial.printf("[INPUT] Enter credential (hex 0-9/A-F, up to 4 chars). Attempts left: %u\n",
+                  (unsigned)(MAX_ATTEMPTS - failedCount));
+  }
+}
+
+// Parses 1-4 hex characters. Returns false if empty, too long, or non-hex.
+bool parseHex(const char *s, uint16_t &out) {
+  size_t n = strlen(s);
+  if (n == 0 || n > 4) return false;
+  uint16_t v = 0;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    uint8_t d;
+    if      (c >= '0' && c <= '9') d = c - '0';
+    else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+    else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+    else return false;
+    v = (uint16_t)((v << 4) | d);
+  }
+  out = v;
+  return true;
+}
+
+void upcase(char *s) { for (; *s; s++) if (*s >= 'a' && *s <= 'z') *s -= 32; }
+
+// ---------------- Login logic -----------------------------------------------
+void processLogin(const char *text) {
+  uint16_t value;
+  if (!parseHex(text, value)) {
+    Serial.println("[ERROR] Invalid input. Use 1-4 hex characters (0-9, A-F). Not counted as an attempt.");
+    printPrompt();
+    return;
+  }
+  state = ST_INPUT;
+  Serial.printf("[VERIFY] Entered value: 0x%04X\n", value);
+
+  if (value == DEMO_CREDENTIAL) {
+    state = ST_GRANTED;
+    failedCount = 0;                       // success resets the counter
+    Serial.println("[GRANTED] *** ACCESS GRANTED ***");
+    indicate(PIN_LED_GREEN, true, 400);
+  } else {
+    failedCount++;
+    if (failedCount >= MAX_ATTEMPTS) {
+      state = ST_LOCKED;
+      Serial.println("[DENIED] Incorrect credential.");
+      Serial.println("[LOCKED] Maximum attempts reached. Interface LOCKED.");
+      indicate(PIN_LED_RED, true, 1500);
+    } else {
+      state = ST_INPUT;                    // DENIED, then ready for retry
+      Serial.printf("[DENIED] Incorrect credential. Failed attempts: %u/%u\n",
+                    failedCount, MAX_ATTEMPTS);
+      indicate(PIN_LED_RED, true, 300);
+    }
+  }
+  printPrompt();
+}
+
+void adminReset() {
+  state = ST_IDLE;
+  failedCount = 0;
+  awaitConfirm = false;
+#if USE_INDICATORS
+  digitalWrite(PIN_LED_RED, LOW);
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+#endif
+  Serial.println("[ADMIN] Reset confirmed. Counter cleared, interface unlocked.");
+  state = ST_INPUT;
+  printPrompt();
+}
+
+void handleLine(char *line) {
+  upcase(line);
+
+  // Two-step admin reset: #RESET then CONFIRM (within timeout)
+  if (awaitConfirm) {
+    if ((long)(millis() - confirmDeadline) > 0) {
+      awaitConfirm = false;
+      Serial.println("[ADMIN] Reset timed out. Cancelled.");
+    } else if (strcmp(line, ADMIN_CONFIRM) == 0) {
+      adminReset();
+      return;
+    } else {
+      awaitConfirm = false;
+      Serial.println("[ADMIN] Reset cancelled.");
+      return;
+    }
+  }
+
+  if (strcmp(line, ADMIN_CMD) == 0) {
+    awaitConfirm = true;
+    confirmDeadline = millis() + ADMIN_TIMEOUT_MS;
+    Serial.println("[ADMIN] Reset requested. Type CONFIRM within 10 s to proceed.");
+    return;
+  }
+  if (strcmp(line, "#STATUS") == 0) {
+    Serial.printf("[STATUS] State=%s, failed attempts=%u/%u\n", stateName(), failedCount, MAX_ATTEMPTS);
+    return;
+  }
+  if (strcmp(line, "#LOGOUT") == 0) {
+    if (state == ST_GRANTED) {
+      state = ST_INPUT;
+      Serial.println("[LOGOUT] Session ended.");
+      printPrompt();
+    } else {
+      Serial.println("[LOGOUT] Not logged in.");
+    }
+    return;
+  }
+
+  if (state == ST_LOCKED) {
+    Serial.println("[LOCKED] Input rejected. Interface is locked. Administrator reset required.");
+    indicate(PIN_LED_RED, true, 150);
+    return;
+  }
+  if (state == ST_GRANTED) {
+    Serial.println("[GRANTED] Already logged in. Type #LOGOUT first.");
+    return;
+  }
+  if (line[0] == '#') {
+    Serial.println("[ERROR] Unknown command.");
+    return;
+  }
+  processLogin(line);
+}
+
+// ---------------- Non-blocking serial line reader ---------------------------
+void pollSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r' || c == '\n') {
+      if (lineLen > 0) {
+        lineBuf[lineLen] = '\0';
+        lineLen = 0;
+        handleLine(lineBuf);
+      }
+    } else if (lineLen < LINE_MAX) {
+      lineBuf[lineLen++] = c;
+    } else {
+      lineLen = 0;                              // overflow: discard line
+      Serial.println("[ERROR] Input too long.");
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  indicatorsInit();
+  Serial.println();
+  Serial.println("==============================================");
+  Serial.println(" ESP32 Hardware-Assisted Login Demo (software model)");
+  Serial.println(" Educational prototype - not production security");
+  Serial.println("==============================================");
+  state = ST_INPUT;
+  printPrompt();
+}
+
+void loop() {
+  pollSerial();
+  indicatorsUpdate();
+}
