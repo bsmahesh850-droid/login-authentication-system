@@ -1,0 +1,28 @@
+# Yosys script. Run from the project root:
+#     yosys -s synthesis/yosys_commands.txt | tee synthesis/yosys_log.txt
+# Install Yosys:  sudo apt install yosys   (Linux)  |  brew install yosys  (macOS)
+
+# 1. Read Verilog
+read_verilog rtl/credential_checker.v rtl/attempt_counter.v rtl/authentication_fsm.v rtl/login_controller.v
+
+# 2. Check hierarchy
+hierarchy -check -top login_controller
+
+# 3. Convert processes to logic, optimise, extract FSM
+proc
+opt
+fsm
+opt
+
+# 4. Generic synthesis (maps to simple gates + flip-flops; no target library)
+synth -top login_controller
+
+# 5. Structural checks and statistics report
+check
+stat
+
+# 6. Write gate-level netlist (optional)
+write_verilog -noattr synthesis/login_controller_netlist.v
+
+# Optional block diagram (needs graphviz):
+#   show -format dot -prefix synthesis/login_controller login_controller
